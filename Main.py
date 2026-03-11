@@ -16,13 +16,14 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.cloud import texttospeech
 from openai import OpenAI
+from dotenv import load_dotenv
+from pathlib import Path
+from dotenv import load_dotenv, dotenv_values
+import smtplib
+from email.message import EmailMessage
 
-
-# =========================
-# OPENAI KEY (HARDCODED)
-# =========================
-OPENAI_API_KEY = ""
-
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 # =========================
 # Configuration
@@ -33,6 +34,8 @@ class Config:
     caretaker_name: str
     phone_number: str  # reserved for SMS use
     openai_model: str
+    openai_api_key: str
+
 
     google_creds_path: str
     spreadsheet_name: str
@@ -52,38 +55,37 @@ class Config:
     context_window_minutes: int
     buffer_maxlen: int
 
-
 def load_config() -> Config:
-    caretaker_name = os.getenv("CARETAKER_NAME", "[INSERT CARETAKER NAME]")
-    phone_number = os.getenv("CARETAKER_PHONE", "[INSERT PHONE NUMBER]")
+    caretaker_name = os.getenv("CARETAKER_NAME")
+    phone_number = os.getenv("CARETAKER_PHONE")
+    openai_api_key = os.getenv("OPENAI_API_KEY", "")
 
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18")
 
-    google_creds_path = os.getenv(
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "/Users/aryandhingra/Documents/Research/bruce-433322-d3bdbe79e165.json"
-    )
+    google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
     listen_timeout = int(os.getenv("LISTEN_TIMEOUT_SEC", "25"))
+
+    mic_device_index = int(os.getenv("MIC_DEVICE_INDEX", "1"))
 
     return Config(
         caretaker_name=caretaker_name,
         phone_number=phone_number,
         openai_model=openai_model,
         google_creds_path=google_creds_path,
+        openai_api_key=openai_api_key,
         spreadsheet_name=os.getenv("SPREADSHEET_NAME", "Research Project"),
         sheet_medicine=os.getenv("SHEET_MEDICINE", "Medicine Log"),
         sheet_emergency=os.getenv("SHEET_EMERGENCY", "Emergency Log"),
         sheet_activity=os.getenv("SHEET_ACTIVITY", "Activity Log"),
         sheet_convo=os.getenv("SHEET_CONVO", "Convo History"),
         sheet_metrics=os.getenv("SHEET_METRICS", "Data"),
-        mic_device_index=int(os.getenv("MIC_DEVICE_INDEX", "1")),
+        mic_device_index=mic_device_index,
         listen_timeout_sec=listen_timeout,
         phrase_time_limit_sec=int(os.getenv("PHRASE_TIME_LIMIT_SEC", "20")),
         context_window_minutes=int(os.getenv("CONTEXT_WINDOW_MIN", "3")),
-        buffer_maxlen=int(os.getenv("BUFFER_MAXLEN", "300")),
+        buffer_maxlen=int(os.getenv("BUFFER_MAXLEN", "300"))
     )
-
 
 # =========================
 # Utilities
@@ -94,7 +96,7 @@ def fmt_date(now: datetime) -> str:
 
 
 def fmt_time(now: datetime) -> str:
-    return now.strftime("%H:%M")
+    return now.strftime("%H:%M:%S")
 
 
 def time_context(now: datetime) -> str:
@@ -118,6 +120,52 @@ def safe_int(x: Any, default: int = 0) -> int:
         return int(x)
     except Exception:
         return default
+    
+def build_emergency_sms(now: datetime, e_type: str, score: int, user_text: str) -> str:
+    # Capitalize emergency type nicely
+    e_type_clean = e_type.strip().title()
+
+    msg = (
+        "🚨Emergency Alert🚨\n\n"
+        f"Emergency Type: {e_type_clean}\n"
+        f"Severity Score: {score}/100\n"
+        f"Patient Input: “{user_text}”"
+    )
+
+    # Verizon SMS gateways sometimes truncate long messages
+    if len(msg) > 500:  # MMS via vtext usually handles more than 160
+        msg = msg[:497] + "..."
+
+    return msg
+
+def send_verizon_sms_via_gmail(body: str) -> bool:
+    gmail_addr = os.getenv("GMAIL_ADDRESS", "").strip()
+    gmail_app_pw = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    to_addr = os.getenv("VERIZON_SMS_TO", "").strip()  # e.g. 2015551234@vtext.com
+
+    if not gmail_addr or not gmail_app_pw or not to_addr:
+        print("[EmailSMS] Missing env vars: GMAIL_ADDRESS, GMAIL_APP_PASSWORD, VERIZON_SMS_TO")
+        return False
+
+    body = (body or "").strip()
+    if len(body) > 160:
+        body = body[:157] + "..."
+
+    msg = EmailMessage()
+    msg["From"] = gmail_addr
+    msg["To"] = to_addr
+    msg["Subject"] = ""  # keep blank; some carriers include subject in SMS
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_addr, gmail_app_pw)
+            smtp.send_message(msg)
+        print("[EmailSMS] Sent.")
+        return True
+    except Exception as e:
+        print(f"[EmailSMS] Failed: {e}")
+        return False
 
 
 # =========================
@@ -226,7 +274,6 @@ class SpeechService:
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
 
-
 # =========================
 # STT (Speech Recognition)
 # =========================
@@ -279,7 +326,7 @@ class ListenService:
 
 class CaretakerBrain:
     def __init__(self, cfg: Config, sheets: SheetsService):
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
+        self.client = OpenAI(api_key=cfg.openai_api_key)
         self.cfg = cfg
         self.sheets = sheets  # used only for priming
 
@@ -287,7 +334,7 @@ class CaretakerBrain:
             "role": "system",
             "content": (
                 f"You are a caregiver for a dementia patient while their family member ({cfg.caretaker_name}) is away. "
-                "Be calm, simple, supportive. Keep the patient safe and inside the home. "
+                "Be calm, simple, and facilitate conversation in a friendly manner. Keep the patient safe. "
                 "Answer in 50 words or less unless you must ask a safety clarifying question.\n\n"
                 "CRITICAL OUTPUT RULE:\n"
                 "Return ONLY valid JSON (no markdown, no extra text) matching this structure:\n"
@@ -301,7 +348,7 @@ class CaretakerBrain:
                 "}\n\n"
                 "Detection rules:\n"
                 "- Emergency: falls, injury, fire, break-in/stranger, wandering/leaving home, severe confusion, chest pain, 'help', etc.\n"
-                "- Activity: walking, eating, showering, bathroom, sleep, exercise, chores, hydration, etc.\n"
+                "- Activity: walking, eating, showering, bathroom, sleep, exercise, chores, etc (not generic talking/conversation).\n"
                 "- Medicine: taking meds, pill box, 'I took my medicine', 'did I take it?', etc.\n"
                 "If uncertain about emergency, ask a clarifying question in reply AND set emergency.flag=true with a cautious score.\n"
             )
@@ -323,7 +370,7 @@ class CaretakerBrain:
                 continue
             date_str, time_str, role, message = row[:4]
             try:
-                ts = datetime.strptime(f"{date_str} {time_str}", "%m/%d/%y %H:%M")
+                ts = datetime.strptime(f"{date_str} {time_str}", "%m/%d/%y %H:%M:%S")
             except ValueError:
                 continue
             if now - ts <= timedelta(minutes=self.cfg.context_window_minutes):
@@ -432,16 +479,23 @@ def queue_detection_logs(logger: BackgroundLogger, sheets: SheetsService, payloa
 def main():
     cfg = load_config()
 
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is empty. Paste your key into OPENAI_API_KEY at the top.")
+    missing = []
+    if not cfg.caretaker_name: missing.append("CARETAKER_NAME")
+    if not cfg.phone_number: missing.append("CARETAKER_PHONE")
+    if not cfg.openai_api_key: missing.append("OPENAI_API_KEY")
+    if not cfg.google_creds_path: missing.append("GOOGLE_APPLICATION_CREDENTIALS")
 
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cfg.google_creds_path
+    if missing:
+        raise RuntimeError("Missing required env vars: " + ", ".join(missing))
+
+
 
     sheets = SheetsService(cfg)
     logger = BackgroundLogger(sheets)
     speaker = SpeechService()
     listener = ListenService(cfg)
     brain = CaretakerBrain(cfg, sheets)
+
 
     while True:
         now = datetime.now()
@@ -455,6 +509,9 @@ def main():
             "Safety rule: Do not instruct the patient to leave the home. "
             "If someone is at the door, ask for details and encourage staying inside. "
             "Remember: output ONLY JSON."
+            "If it is morning or evening and medicine has not been mentioned recently,"
+            "you MAY gently remind the patient in one short, natural sentence."
+            "Do not repeat reminders every turn."
         )
 
         # 1) OpenAI call (must wait)
@@ -463,6 +520,16 @@ def main():
         reply = str(payload.get("reply", "")).strip()
         if not reply:
             reply = "I’m here with you. What’s going on?"
+        
+        det = payload.get("detections", {}) or {}
+        e = det.get("emergency", {}) or {}
+        if bool(e.get("flag", False)):
+            e_type = str(e.get("type", "Unknown")).strip() or "Unknown"
+            score = max(0, min(100, safe_int(e.get("score", 0), default=0)))
+
+            sms_body = build_emergency_sms(now, e_type, score, user_text)
+            send_verizon_sms_via_gmail(sms_body)
+
 
         # 2) Queue ALL sheet writes immediately (non-blocking)
         t_log_start = time.perf_counter()
@@ -474,7 +541,6 @@ def main():
         queue_overhead = time.perf_counter() - t_log_start
         print(f"Queued log overhead (sec): {queue_overhead:.3f}")
 
-        # 3) Latency win #2: TTS synthesis overlaps with background logging
         # Synthesize first (network), while logger thread is writing to sheets.
         audio = speaker.synthesize(reply)
 
