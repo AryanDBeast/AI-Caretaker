@@ -4,101 +4,62 @@ import time
 import json
 import calendar
 import threading
+import smtplib
 from queue import Queue, Empty
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 from typing import Optional, Deque, Tuple, List, Dict, Any
+from pathlib import Path
+from email.message import EmailMessage
 
 import speech_recognition as sr
 import pygame
-import gspread
-from google.oauth2.service_account import Credentials
 from google.cloud import texttospeech
 from openai import OpenAI
 from dotenv import load_dotenv
-from pathlib import Path
-from dotenv import load_dotenv, dotenv_values
-import smtplib
-from email.message import EmailMessage
+
+from database_service import DatabaseService
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
-# =========================
-# Configuration
-# =========================
 
 @dataclass(frozen=True)
 class Config:
-    caretaker_name: str
-    phone_number: str  # reserved for SMS use
     openai_model: str
     openai_api_key: str
-
-
-    google_creds_path: str
-    spreadsheet_name: str
-
-    # Sheet tab names
-    sheet_medicine: str
-    sheet_emergency: str
-    sheet_activity: str
-    sheet_convo: str
-    sheet_metrics: str
-
     mic_device_index: int
     listen_timeout_sec: int
     phrase_time_limit_sec: int
-
-    # context window for conversation memory
     context_window_minutes: int
     buffer_maxlen: int
 
+@dataclass(frozen=True)
+class ActivePatient:
+    patient_id: int
+    patient_first_name: str
+    patient_last_name: str
+    dob: str
+    caregiver_id: int
+    caregiver_first_name: str
+    caregiver_last_name: str
+    caregiver_phone: str
+
+
+# Loads environment variables into a strongly typed config object.
 def load_config() -> Config:
-    caretaker_name = os.getenv("CARETAKER_NAME")
-    phone_number = os.getenv("CARETAKER_PHONE")
-    openai_api_key = os.getenv("OPENAI_API_KEY", "")
-
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18")
-
-    google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
-    listen_timeout = int(os.getenv("LISTEN_TIMEOUT_SEC", "25"))
-
-    mic_device_index = int(os.getenv("MIC_DEVICE_INDEX", "1"))
-
     return Config(
-        caretaker_name=caretaker_name,
-        phone_number=phone_number,
-        openai_model=openai_model,
-        google_creds_path=google_creds_path,
-        openai_api_key=openai_api_key,
-        spreadsheet_name=os.getenv("SPREADSHEET_NAME", "Research Project"),
-        sheet_medicine=os.getenv("SHEET_MEDICINE", "Medicine Log"),
-        sheet_emergency=os.getenv("SHEET_EMERGENCY", "Emergency Log"),
-        sheet_activity=os.getenv("SHEET_ACTIVITY", "Activity Log"),
-        sheet_convo=os.getenv("SHEET_CONVO", "Convo History"),
-        sheet_metrics=os.getenv("SHEET_METRICS", "Data"),
-        mic_device_index=mic_device_index,
-        listen_timeout_sec=listen_timeout,
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18").strip(),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        mic_device_index=int(os.getenv("MIC_DEVICE_INDEX", "1")),
+        listen_timeout_sec=int(os.getenv("LISTEN_TIMEOUT_SEC", "25")),
         phrase_time_limit_sec=int(os.getenv("PHRASE_TIME_LIMIT_SEC", "20")),
         context_window_minutes=int(os.getenv("CONTEXT_WINDOW_MIN", "3")),
-        buffer_maxlen=int(os.getenv("BUFFER_MAXLEN", "300"))
+        buffer_maxlen=int(os.getenv("BUFFER_MAXLEN", "300")),
     )
 
-# =========================
-# Utilities
-# =========================
-
-def fmt_date(now: datetime) -> str:
-    return now.strftime("%D")
-
-
-def fmt_time(now: datetime) -> str:
-    return now.strftime("%H:%M:%S")
-
-
+# Returns a human-readable time context string for the model.
 def time_context(now: datetime) -> str:
     day_name = calendar.day_name[now.weekday()]
     date_str = now.strftime("%B %d, %Y")
@@ -106,6 +67,7 @@ def time_context(now: datetime) -> str:
     return f"Current local date/time: {day_name}, {date_str} at {time_str}."
 
 
+# Infers whether the current time is morning, evening, or unknown.
 def infer_time_of_day(now: datetime) -> str:
     hhmm = int(now.strftime("%H%M"))
     if 600 <= hhmm < 1200:
@@ -115,37 +77,48 @@ def infer_time_of_day(now: datetime) -> str:
     return "Unknown"
 
 
+# Safely converts a value to int with a default fallback.
 def safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
     except Exception:
         return default
-    
-def build_emergency_sms(now: datetime, e_type: str, score: int, user_text: str) -> str:
-    # Capitalize emergency type nicely
-    e_type_clean = e_type.strip().title()
 
+
+# Formats a datetime into a SQLite-friendly timestamp string.
+def to_db_timestamp(now: datetime) -> str:
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# Builds the outgoing emergency alert SMS message.
+def build_emergency_sms(e_type: str, score: int, user_text: str) -> str:
+    e_type_clean = e_type.strip().title()
     msg = (
         "🚨Emergency Alert🚨\n\n"
         f"Emergency Type: {e_type_clean}\n"
         f"Severity Score: {score}/100\n"
-        f"Patient Input: “{user_text}”"
+        f'Patient Input: "{user_text}"'
     )
-
-    # Verizon SMS gateways sometimes truncate long messages
-    if len(msg) > 500:  # MMS via vtext usually handles more than 160
+    if len(msg) > 500:
         msg = msg[:497] + "..."
-
     return msg
 
-def send_verizon_sms_via_gmail(body: str) -> bool:
+
+# Sends an emergency SMS through Gmail to a Verizon SMS gateway.
+def send_verizon_sms_via_gmail(body: str, caregiver_phone: str) -> bool:
     gmail_addr = os.getenv("GMAIL_ADDRESS", "").strip()
     gmail_app_pw = os.getenv("GMAIL_APP_PASSWORD", "").strip()
-    to_addr = os.getenv("VERIZON_SMS_TO", "").strip()  # e.g. 2015551234@vtext.com
 
-    if not gmail_addr or not gmail_app_pw or not to_addr:
-        print("[EmailSMS] Missing env vars: GMAIL_ADDRESS, GMAIL_APP_PASSWORD, VERIZON_SMS_TO")
+    if not gmail_addr or not gmail_app_pw:
+        print("[EmailSMS] Missing env vars: GMAIL_ADDRESS, GMAIL_APP_PASSWORD")
         return False
+
+    digits_only = "".join(ch for ch in caregiver_phone if ch.isdigit())
+    if len(digits_only) != 10:
+        print(f"[EmailSMS] Invalid caregiver phone number: {caregiver_phone}")
+        return False
+
+    to_addr = f"{digits_only}@vtext.com"
 
     body = (body or "").strip()
     if len(body) > 160:
@@ -154,77 +127,57 @@ def send_verizon_sms_via_gmail(body: str) -> bool:
     msg = EmailMessage()
     msg["From"] = gmail_addr
     msg["To"] = to_addr
-    msg["Subject"] = ""  # keep blank; some carriers include subject in SMS
+    msg["Subject"] = ""
     msg.set_content(body)
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(gmail_addr, gmail_app_pw)
             smtp.send_message(msg)
-        print("[EmailSMS] Sent.")
+        print(f"[EmailSMS] Sent to {to_addr}.")
         return True
     except Exception as e:
         print(f"[EmailSMS] Failed: {e}")
         return False
 
+def choose_patient(db: DatabaseService) -> ActivePatient:
+    patients = db.list_patients()
 
-# =========================
-# Google Sheets Service
-# =========================
+    print("\nSelect Patient\n")
+    for p in patients:
+        print(f"{p[0]}. {p[1]} {p[2]}")
 
-class SheetsService:
-    def __init__(self, cfg: Config):
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(cfg.google_creds_path, scopes=scopes)
-        gc = gspread.authorize(creds)
+    while True:
+        try:
+            choice = int(input("\nEnter patient number: "))
+            row = db.get_patient_with_caregiver(choice)
+            if row:
+                return ActivePatient(
+                    patient_id=row[0],
+                    patient_first_name=row[1],
+                    patient_last_name=row[2],
+                    dob=row[3],
+                    caregiver_id=row[4],
+                    caregiver_first_name=row[5],
+                    caregiver_last_name=row[6],
+                    caregiver_phone=row[7],
+                )
+        except Exception:
+            pass
 
-        spread = gc.open(cfg.spreadsheet_name)
+        print("Invalid selection. Try again.")
 
-        self.medicine = spread.worksheet(cfg.sheet_medicine)
-        self.emergency = spread.worksheet(cfg.sheet_emergency)
-        self.activity = spread.worksheet(cfg.sheet_activity)
-        self.convo = spread.worksheet(cfg.sheet_convo)
-        self.metrics = spread.worksheet(cfg.sheet_metrics)
-
-    def append_conversation_pair(self, now: datetime, user_text: str, assistant_text: str) -> None:
-        d, t = fmt_date(now), fmt_time(now)
-        self.convo.append_rows([
-            [d, t, "User", user_text],
-            [d, t, "Assistant", assistant_text],
-        ])
-
-    def append_medicine(self, now: datetime, time_of_day: str, patient_input: str) -> None:
-        self.medicine.append_row([fmt_date(now), fmt_time(now), time_of_day, patient_input])
-
-    def append_emergency(self, now: datetime, e_type: str, score: int, patient_input: str) -> None:
-        self.emergency.append_row([fmt_date(now), fmt_time(now), e_type, str(score), patient_input])
-
-    def append_activity(self, now: datetime, a_type: str, patient_input: str) -> None:
-        self.activity.append_row([fmt_date(now), fmt_time(now), a_type, patient_input])
-
-    def append_metrics(self, speech_s: float, response_s: float, update_s: float) -> None:
-        self.metrics.append_row([f"{speech_s:.3f}", f"{response_s:.3f}", f"{update_s:.3f}"])
-
-
-# =========================
-# Background Sheets Logger (1 worker thread)
-# =========================
 
 class BackgroundLogger:
-    """
-    Runs ALL sheet writes in a single background thread so the main loop
-    can move on (especially to TTS playback) without waiting.
-    """
-    def __init__(self, sheets: SheetsService):
-        self.sheets = sheets
+    # Starts a background worker that executes queued database writes.
+    def __init__(self, db: DatabaseService):
+        self.db = db
         self.q: Queue = Queue()
         self._stop = threading.Event()
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
+    # Continuously processes queued logging tasks.
     def _run(self):
         while not self._stop.is_set():
             try:
@@ -238,33 +191,43 @@ class BackgroundLogger:
             finally:
                 self.q.task_done()
 
+    # Adds a database write task to the queue.
     def submit(self, fn, *args):
         self.q.put((fn, args))
 
+    # Stops the background worker loop.
     def stop(self):
         self._stop.set()
 
 
-# =========================
-# TTS + Audio Playback
-# =========================
-
 class SpeechService:
+    # Initializes audio playback and Google Cloud TTS.
     def __init__(self):
         pygame.mixer.init()
         self.tts_client = texttospeech.TextToSpeechClient()
 
+    # Converts text into spoken MP3 audio in memory.
     def synthesize(self, text: str) -> Optional[io.BytesIO]:
         try:
             synthesis_input = texttospeech.SynthesisInput(text=text)
-            voice = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Wavenet-D")
-            audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-            resp = self.tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="en-US",
+                name="en-US-Wavenet-D"
+            )
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.MP3
+            )
+            resp = self.tts_client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config
+            )
             return io.BytesIO(resp.audio_content)
         except Exception as e:
             print(f"TTS error: {e}")
             return None
 
+    # Plays synthesized audio through pygame.
     def play(self, audio_stream: Optional[io.BytesIO]) -> None:
         if audio_stream is None:
             return
@@ -274,20 +237,17 @@ class SpeechService:
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(10)
 
-# =========================
-# STT (Speech Recognition)
-# =========================
 
 class ListenService:
+    # Configures the microphone and speech recognizer.
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.recognizer = sr.Recognizer()
-
-        # dementia-friendly pause behavior
         self.recognizer.pause_threshold = 2
         self.recognizer.energy_threshold = 300
         self.recognizer.dynamic_energy_threshold = True
 
+    # Listens once from the microphone and returns transcript plus STT time.
     def listen_once(self) -> Tuple[Optional[str], float]:
         try:
             with sr.Microphone(device_index=self.cfg.mic_device_index) as source:
@@ -298,44 +258,41 @@ class ListenService:
                     phrase_time_limit=self.cfg.phrase_time_limit_sec
                 )
 
-            t0 = time.perf_counter()
             text = self.recognizer.recognize_google(audio)
-            speech_time = time.perf_counter() - t0
 
             print(f"You said: {text}")
-            print(f"Speech Time (sec): {speech_time:.3f}")
-            return text, speech_time
+            return text
 
         except sr.WaitTimeoutError:
-            return None, 0.0
+            return None
         except (AssertionError, OSError) as e:
             print(f"Mic error (device changed/disconnected): {e}")
             time.sleep(0.5)
-            return None, 0.0
+            return None
         except sr.UnknownValueError:
             print("Sorry, I did not understand that.")
-            return None, 0.0
+            return None
         except sr.RequestError:
             print("Sorry, there was an issue with the speech recognition service.")
-            return None, 0.0
+            return None
 
-
-# =========================
-# OpenAI + Conversation Memory + Structured Detection
-# =========================
 
 class CaretakerBrain:
-    def __init__(self, cfg: Config, sheets: SheetsService):
+    # Sets up the LLM client, system prompt, and short-term memory buffer.
+    def __init__(self, cfg: Config, active_patient: ActivePatient):
         self.client = OpenAI(api_key=cfg.openai_api_key)
         self.cfg = cfg
-        self.sheets = sheets  # used only for priming
-
+        self.active_patient = active_patient
+        self.recent_buffer: Deque[Tuple[datetime, str, str]] = deque(maxlen=cfg.buffer_maxlen)
         self.system_prompt = {
             "role": "system",
             "content": (
-                f"You are a caregiver for a dementia patient while their family member ({cfg.caretaker_name}) is away. "
-                "Be calm, simple, and facilitate conversation in a friendly manner. Keep the patient safe. "
-                "Answer in 50 words or less unless you must ask a safety clarifying question.\n\n"
+                f"You are a caregiver assistant speaking with dementia patient "
+                f"{active_patient.patient_first_name} {active_patient.patient_last_name}. "
+                f"The patient's caregiver is "
+                f"{active_patient.caregiver_first_name} {active_patient.caregiver_last_name}. "
+                f"Be calm, simple, warm, and safe. Facilitate conversation in a friendly manner. "
+                f"Answer in 50 words or less unless you must ask a safety clarifying question.\n\n"
                 "CRITICAL OUTPUT RULE:\n"
                 "Return ONLY valid JSON (no markdown, no extra text) matching this structure:\n"
                 "{\n"
@@ -348,34 +305,13 @@ class CaretakerBrain:
                 "}\n\n"
                 "Detection rules:\n"
                 "- Emergency: falls, injury, fire, break-in/stranger, wandering/leaving home, severe confusion, chest pain, 'help', etc.\n"
-                "- Activity: walking, eating, showering, bathroom, sleep, exercise, chores, etc (not generic talking/conversation).\n"
+                "- Activity: walking, eating, showering, bathroom, sleep, exercise, chores, etc.\n"
                 "- Medicine: taking meds, pill box, 'I took my medicine', 'did I take it?', etc.\n"
                 "If uncertain about emergency, ask a clarifying question in reply AND set emergency.flag=true with a cautious score.\n"
             )
         }
 
-        self.recent_buffer: Deque[Tuple[datetime, str, str]] = deque(maxlen=cfg.buffer_maxlen)
-        self._prime_from_sheet()
-
-    def _prime_from_sheet(self) -> None:
-        try:
-            rows = self.sheets.convo.get_all_values()
-        except Exception as e:
-            print(f"Warning: couldn't prime buffer from sheet: {e}")
-            return
-
-        now = datetime.now()
-        for row in rows[1:]:
-            if len(row) < 4:
-                continue
-            date_str, time_str, role, message = row[:4]
-            try:
-                ts = datetime.strptime(f"{date_str} {time_str}", "%m/%d/%y %H:%M:%S")
-            except ValueError:
-                continue
-            if now - ts <= timedelta(minutes=self.cfg.context_window_minutes):
-                self.recent_buffer.append((ts, role.lower(), message))
-
+    # Builds the message list for the LLM using recent conversational context.
     def _build_messages(self, user_text: str, dynamic_system: str) -> List[Dict[str, str]]:
         now = datetime.now()
         msgs: List[Dict[str, str]] = [
@@ -384,14 +320,16 @@ class CaretakerBrain:
         ]
 
         for ts, role, message in self.recent_buffer:
-            if now - ts <= timedelta(minutes=self.cfg.context_window_minutes):
-                role_norm = role.strip().lower()
-                r = "assistant" if role_norm == "assistant" else "user"
-                msgs.append({"role": r, "content": message})
+            if (now - ts).total_seconds() <= self.cfg.context_window_minutes * 60:
+                msgs.append({
+                    "role": "assistant" if role == "assistant" else "user",
+                    "content": message
+                })
 
         msgs.append({"role": "user", "content": user_text})
         return msgs
 
+    # Parses the model output into a Python dictionary.
     def _parse_json(self, text: str) -> Dict[str, Any]:
         text = text.strip()
         try:
@@ -402,18 +340,13 @@ class CaretakerBrain:
         first = text.find("{")
         last = text.rfind("}")
         if first != -1 and last != -1 and last > first:
-            candidate = text[first:last + 1]
-            return json.loads(candidate)
+            return json.loads(text[first:last + 1])
 
         raise ValueError("Could not parse JSON from model output.")
 
+    # Sends the user input to the LLM and returns structured JSON plus latency.
     def respond_structured(self, now: datetime, user_text: str, dynamic_system: str) -> Tuple[Dict[str, Any], float]:
-        """
-        Sheets writes are queued in BackgroundLogger from main().
-        """
-        t0 = time.perf_counter()
 
-        # request JSON mode if supported
         try:
             completion = self.client.chat.completions.create(
                 model=self.cfg.openai_model,
@@ -426,8 +359,6 @@ class CaretakerBrain:
                 messages=self._build_messages(user_text, dynamic_system),
             )
 
-        response_time = time.perf_counter() - t0
-
         raw = completion.choices[0].message.content or ""
         payload = self._parse_json(raw)
 
@@ -436,115 +367,110 @@ class CaretakerBrain:
             reply = "I’m here with you. Can you tell me what you need right now?"
             payload["reply"] = reply
 
-        # Update buffer for context
         self.recent_buffer.append((now, "user", user_text))
         self.recent_buffer.append((now, "assistant", reply))
 
-        print(f"OpenAI Response Time (sec): {response_time:.3f}")
-        return payload, response_time
+        return payload
 
 
-# =========================
-# Detection → Sheet Logging (queued)
-# =========================
-
-def queue_detection_logs(logger: BackgroundLogger, sheets: SheetsService, payload: Dict[str, Any], now: datetime, user_text: str) -> None:
+# Queues all detection-based database log writes for the current turn.
+def queue_detection_logs(
+    logger: BackgroundLogger,
+    db: DatabaseService,
+    patient_id: int,
+    payload: Dict[str, Any],
+    now: datetime,
+    user_text: str
+) -> None:
+    ts = to_db_timestamp(now)
     det = payload.get("detections", {}) or {}
 
     e = det.get("emergency", {}) or {}
     if bool(e.get("flag", False)):
         e_type = str(e.get("type", "Unknown")).strip() or "Unknown"
         score = max(0, min(100, safe_int(e.get("score", 0), default=0)))
-        logger.submit(sheets.append_emergency, now, e_type, score, user_text)
+        statement = f"[{e_type}] {user_text}"
+        logger.submit(db.append_emergency, patient_id, ts, score, statement)
 
     a = det.get("activity", {}) or {}
     if bool(a.get("flag", False)):
         a_type = str(a.get("type", "Unknown")).strip() or "Unknown"
-        logger.submit(sheets.append_activity, now, a_type, user_text)
+        logger.submit(db.append_activity, patient_id, ts, a_type, user_text)
 
     m = det.get("medicine", {}) or {}
     if bool(m.get("flag", False)):
-        tod = str(m.get("time_of_day", "Unknown")).strip() or "Unknown"
-        if tod not in {"Morning", "Evening", "Unknown"}:
-            tod = "Unknown"
-        if tod == "Unknown":
-            tod = infer_time_of_day(now)
-        logger.submit(sheets.append_medicine, now, tod, user_text)
+        medication_type = str(m.get("time_of_day", "Unknown")).strip() or "Unknown"
+        if medication_type not in {"Morning", "Evening", "Unknown"}:
+            medication_type = "Unknown"
+        if medication_type == "Unknown":
+            medication_type = infer_time_of_day(now)
+        logger.submit(db.append_medication, patient_id, ts, medication_type, user_text)
 
 
-# =========================
-# Main App
-# =========================
-
+# Runs the caretaker application loop.
 def main():
     cfg = load_config()
 
     missing = []
-    if not cfg.caretaker_name: missing.append("CARETAKER_NAME")
-    if not cfg.phone_number: missing.append("CARETAKER_PHONE")
-    if not cfg.openai_api_key: missing.append("OPENAI_API_KEY")
-    if not cfg.google_creds_path: missing.append("GOOGLE_APPLICATION_CREDENTIALS")
+    if not cfg.openai_api_key:
+        missing.append("OPENAI_API_KEY")
 
     if missing:
         raise RuntimeError("Missing required env vars: " + ", ".join(missing))
 
+    db = DatabaseService()
+    active_patient = choose_patient(db)
 
+    print(f"\nLoaded Patient: {active_patient.patient_first_name} {active_patient.patient_last_name}")
+    print(f"Caregiver: {active_patient.caregiver_first_name} {active_patient.caregiver_last_name}")
+    print(f"Caregiver Phone: {active_patient.caregiver_phone}\n")
 
-    sheets = SheetsService(cfg)
-    logger = BackgroundLogger(sheets)
+    logger = BackgroundLogger(db)
+    brain = CaretakerBrain(cfg, active_patient)
     speaker = SpeechService()
     listener = ListenService(cfg)
-    brain = CaretakerBrain(cfg, sheets)
-
 
     while True:
         now = datetime.now()
+        ts = to_db_timestamp(now)
 
-        user_text, speech_time = listener.listen_once()
+        user_text = listener.listen_once()
         if not user_text:
             continue
 
         dynamic_system = (
             f"{time_context(now)} "
+            f"You are currently assisting patient {active_patient.patient_first_name} "
+            f"{active_patient.patient_last_name}. "
+            f"The caregiver for this patient is {active_patient.caregiver_first_name} "
+            f"{active_patient.caregiver_last_name}. "
             "Safety rule: Do not instruct the patient to leave the home. "
             "If someone is at the door, ask for details and encourage staying inside. "
-            "Remember: output ONLY JSON."
-            "If it is morning or evening and medicine has not been mentioned recently,"
-            "you MAY gently remind the patient in one short, natural sentence."
+            "Remember: output ONLY JSON. "
+            "If it is morning or evening and medicine has not been mentioned recently, "
+            "you MAY gently remind the patient in one short, natural sentence. "
             "Do not repeat reminders every turn."
         )
 
-        # 1) OpenAI call (must wait)
-        payload, response_time = brain.respond_structured(now, user_text, dynamic_system)
+        payload = brain.respond_structured(now, user_text, dynamic_system)
 
         reply = str(payload.get("reply", "")).strip()
         if not reply:
             reply = "I’m here with you. What’s going on?"
-        
+
         det = payload.get("detections", {}) or {}
         e = det.get("emergency", {}) or {}
         if bool(e.get("flag", False)):
             e_type = str(e.get("type", "Unknown")).strip() or "Unknown"
             score = max(0, min(100, safe_int(e.get("score", 0), default=0)))
+            sms_body = build_emergency_sms(e_type, score, user_text)
+            send_verizon_sms_via_gmail(sms_body, active_patient.caregiver_phone)
 
-            sms_body = build_emergency_sms(now, e_type, score, user_text)
-            send_verizon_sms_via_gmail(sms_body)
+        logger.submit(db.append_conversation_pair, active_patient.patient_id, ts, user_text, reply)
+        queue_detection_logs(logger, db, active_patient.patient_id, payload, now, user_text)
 
-
-        # 2) Queue ALL sheet writes immediately (non-blocking)
-        t_log_start = time.perf_counter()
-
-        logger.submit(sheets.append_conversation_pair, now, user_text, reply)
-        queue_detection_logs(logger, sheets, payload, now, user_text)
-        logger.submit(sheets.append_metrics, speech_time, response_time, 0.0)
-
-        queue_overhead = time.perf_counter() - t_log_start
-        print(f"Queued log overhead (sec): {queue_overhead:.3f}")
-
-        # Synthesize first (network), while logger thread is writing to sheets.
         audio = speaker.synthesize(reply)
 
-        # 4) Speak / play audio (logger continues in background)
         print(f"Assistant Reply: {reply}")
         speaker.play(audio)
 
