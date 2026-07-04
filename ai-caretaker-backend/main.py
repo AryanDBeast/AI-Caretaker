@@ -159,12 +159,10 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
             if patient_row:
                 patient_name = f"{patient_row[1]} {patient_row[2]}"
                 caregiver_phone = patient_row[7]
-                minutes = int(RESPONSE_WINDOW.total_seconds() // 60)
-                sms_body = build_emergency_sms(
-                    "No Response To Check-In",
-                    NO_RESPONSE_SEVERITY,
-                    last_user_text or f"No response in {minutes} minutes",
-                    patient_name,
+                hours = int(CHECK_IN_AFTER.total_seconds() // 3600)
+                sms_body = (
+                    f"{patient_name} has not responded in {hours} hours "
+                    f"and did not check in."
                 )
                 send_verizon_sms_via_gmail(sms_body, caregiver_phone)
 
