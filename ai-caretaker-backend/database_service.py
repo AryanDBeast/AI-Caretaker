@@ -15,7 +15,10 @@ class DatabaseService:
         if not database_url:
             raise ValueError("DATABASE_URL not found in environment")
 
-        self.conn = psycopg.connect(database_url)
+        # autocommit: without it, psycopg holds every SELECT open in an idle
+        # transaction, which keeps table locks and blocks things like
+        # ALTER TABLE (causing "upstream timeout" errors in Supabase).
+        self.conn = psycopg.connect(database_url, autocommit=True)
         self.cursor = self.conn.cursor()
 
     def close(self):
@@ -64,7 +67,7 @@ class DatabaseService:
                 severity_score,
             ),
         )
-        self.conn.commit()
+        # autocommit connection — the INSERT is committed immediately
 
     def get_patient_with_caregiver(self, patient_id):
         self.cursor.execute(
@@ -127,6 +130,52 @@ class DatabaseService:
             (patient_id,),
         )
         return self.cursor.fetchone()
+
+    # -----------------------------------------------------------
+    # Login / caregiver-scoped queries
+    # -----------------------------------------------------------
+    def verify_caregiver_login(self, username, password):
+        """Check username + password against the bcrypt hash in the DB.
+        Verification happens inside Postgres via pgcrypto's crypt(),
+        so the hash never leaves the database.
+        Returns (caregiver_id, first_name, last_name) or None."""
+        self.cursor.execute(
+            """
+            SELECT caregiver_id, caregiver_first_name, caregiver_last_name
+            FROM caregiver
+            WHERE username = %s
+              AND password_hash IS NOT NULL
+              AND password_hash = crypt(%s, password_hash)
+            """,
+            (username, password),
+        )
+        return self.cursor.fetchone()
+
+    def list_patients_for_caregiver(self, caregiver_id):
+        """Only the patients assigned to this caregiver."""
+        self.cursor.execute(
+            """
+            SELECT patient_id, patient_first_name, patient_last_name
+            FROM patient
+            WHERE caregiver_id = %s
+            ORDER BY patient_id
+            """,
+            (caregiver_id,),
+        )
+        return self.cursor.fetchall()
+
+    def patient_belongs_to_caregiver(self, patient_id, caregiver_id):
+        """True if this patient is assigned to this caregiver."""
+        self.cursor.execute(
+            """
+            SELECT 1
+            FROM patient
+            WHERE patient_id = %s
+              AND caregiver_id = %s
+            """,
+            (patient_id, caregiver_id),
+        )
+        return self.cursor.fetchone() is not None
 
     def list_caregivers(self):
         self.cursor.execute(
