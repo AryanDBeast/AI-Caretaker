@@ -74,17 +74,23 @@ const Icons = {
   download: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
   privacy:  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>,
   terms:    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>,
+  user:     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
+  lock:     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
 export default function Home() {
   const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
 
-  const [step, setStep]                           = useState<"caregiver"|"patient"|"dashboard">("caregiver");
-  const [caregivers, setCaregivers]               = useState<Caregiver[]>([]);
-  const [caregiversLoading, setCaregiversLoading] = useState(false);
+  const [step, setStep]                           = useState<"login"|"patient"|"dashboard">("login");
+  const [token, setToken]                         = useState<string | null>(null);
   const [selectedCaregiver, setSelectedCaregiver] = useState<Caregiver | null>(null);
+  const [username, setUsername]                   = useState("");
+  const [password, setPassword]                   = useState("");
+  const [loginError, setLoginError]               = useState("");
+  const [loggingIn, setLoggingIn]                 = useState(false);
   const [patients, setPatients]                   = useState<Patient[]>([]);
+  const [patientsLoading, setPatientsLoading]     = useState(false);
   const [selectedPatient, setSelectedPatient]     = useState<Patient | null>(null);
   const [logs, setLogs]                           = useState<LogEntry[]>([]);
   const [page, setPage]                           = useState("home");
@@ -92,41 +98,105 @@ export default function Home() {
   const [search, setSearch]                       = useState("");
   const [loading, setLoading]                     = useState(false);
 
-  // fetch caregivers on mount — replaces hardcoded list
+  const authHeaders = (tk: string | null): Record<string, string> =>
+    tk ? { Authorization: `Bearer ${tk}` } : {};
+
+  const logout = () => {
+    if (token) {
+      fetch(`${BACKEND}/logout`, { method:"POST", headers: authHeaders(token) }).catch(() => {});
+    }
+    sessionStorage.removeItem("caretaker_token");
+    sessionStorage.removeItem("caretaker_caregiver");
+    setToken(null);
+    setSelectedCaregiver(null);
+    setSelectedPatient(null);
+    setPatients([]);
+    setLogs([]);
+    setUsername("");
+    setPassword("");
+    setStep("login");
+  };
+
+  // restore session on mount (survives page refresh)
   useEffect(() => {
-    setCaregiversLoading(true);
-    fetch(`${BACKEND}/caregivers`)
-      .then(r => r.json())
-      .then((data: Caregiver[]) => setCaregivers(data))
-      .catch(console.error)
-      .finally(() => setCaregiversLoading(false));
+    const savedToken = sessionStorage.getItem("caretaker_token");
+    const savedCaregiver = sessionStorage.getItem("caretaker_caregiver");
+    if (savedToken && savedCaregiver) {
+      try {
+        setToken(savedToken);
+        setSelectedCaregiver(JSON.parse(savedCaregiver));
+        setStep("patient");
+      } catch { /* fall through to login */ }
+    }
   }, []);
 
-  // fetch patients when caregiver is selected
+  const handleLogin = async () => {
+    if (!username.trim() || !password) {
+      setLoginError("Please enter your username and password.");
+      return;
+    }
+    setLoggingIn(true);
+    setLoginError("");
+    try {
+      const res = await fetch(`${BACKEND}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      if (!res.ok) {
+        setLoginError(res.status === 401 ? "Invalid username or password." : "Login failed. Please try again.");
+        return;
+      }
+      const data = await res.json();
+      setToken(data.token);
+      setSelectedCaregiver(data.caregiver);
+      sessionStorage.setItem("caretaker_token", data.token);
+      sessionStorage.setItem("caretaker_caregiver", JSON.stringify(data.caregiver));
+      setPassword("");
+      setStep("patient");
+    } catch {
+      setLoginError("Could not reach the server. Is the backend running?");
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  // fetch ONLY this caregiver's patients once logged in
   useEffect(() => {
-    if (!selectedCaregiver) return;
-    fetch(`${BACKEND}/patients`)
-      .then(r => r.json())
+    if (!token || step !== "patient") return;
+    setPatientsLoading(true);
+    fetch(`${BACKEND}/me/patients`, { headers: authHeaders(token) })
+      .then(r => {
+        if (r.status === 401) { logout(); throw new Error("unauthorized"); }
+        return r.json();
+      })
       .then((data: Patient[]) => setPatients(data))
-      .catch(console.error);
-  }, [selectedCaregiver]);
+      .catch(console.error)
+      .finally(() => setPatientsLoading(false));
+  }, [token, step]);
 
   // fetch logs when patient is selected
   useEffect(() => {
-    if (!selectedPatient) return;
+    if (!selectedPatient || !token) return;
     setLoading(true);
-    fetch(`${BACKEND}/patients/${selectedPatient.id}/statements`)
-      .then(r => r.json())
+    fetch(`${BACKEND}/patients/${selectedPatient.id}/statements`, { headers: authHeaders(token) })
+      .then(r => {
+        if (r.status === 401) { logout(); throw new Error("unauthorized"); }
+        return r.json();
+      })
       .then(data => setLogs((data as any[]).map(normalizeLog)))
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, [selectedPatient]);
+  }, [selectedPatient, token]);
 
   const refreshLogs = () => {
-    if (!selectedPatient) return;
+    if (!selectedPatient || !token) return;
     setLoading(true);
-    fetch(`${BACKEND}/patients/${selectedPatient.id}/statements`)
-      .then(r => r.json())
+    fetch(`${BACKEND}/patients/${selectedPatient.id}/statements`, { headers: authHeaders(token) })
+      .then(r => {
+        if (r.status === 401) { logout(); throw new Error("unauthorized"); }
+        return r.json();
+      })
       .then(data => setLogs((data as any[]).map(normalizeLog)))
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -136,42 +206,76 @@ export default function Home() {
   const medicines   = logs.filter(l => l.medication_type);
   const activities  = logs.filter(l => l.activity_type);
 
-  // ── STEP 1: caregiver select ─────────────────────────────────────────────
-  if (step === "caregiver") {
+  // ── STEP 1: caregiver login ───────────────────────────────────────────────
+  if (step === "login") {
     return (
       <div style={{ fontFamily:"'DM Sans', system-ui, sans-serif", background:"#f0fdf9", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center" }}>
         <style>{`
           @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Serif+Display&display=swap');
           * { box-sizing: border-box; }
-          .cg-btn { transition: all 0.18s ease; }
-          .cg-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(13,148,136,0.25); }
+          .login-input { width: 100%; display: flex; align-items: center; gap: 10px; background: white; border: 1.5px solid #e2e8f0; border-radius: 12px; padding: 12px 14px; transition: border-color 0.15s ease; }
+          .login-input:focus-within { border-color: ${TEAL}; box-shadow: 0 0 0 3px rgba(13,148,136,0.12); }
+          .login-input input { border: none; outline: none; flex: 1; font-size: 14px; color: #1e293b; background: transparent; font-family: inherit; }
+          .login-input input::placeholder { color: #94a3b8; }
+          .login-btn { transition: all 0.18s ease; }
+          .login-btn:hover:not(:disabled) { opacity: 0.92; transform: translateY(-1px); }
+          .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
         `}</style>
         <div style={{ position:"fixed", top:"-80px", right:"-80px", width:"320px", height:"320px", borderRadius:"50%", background:"radial-gradient(circle, rgba(13,148,136,0.12) 0%, transparent 70%)", pointerEvents:"none" }} />
         <div style={{ position:"fixed", bottom:"-60px", left:"-60px", width:"260px", height:"260px", borderRadius:"50%", background:"radial-gradient(circle, rgba(13,148,136,0.08) 0%, transparent 70%)", pointerEvents:"none" }} />
-        <div style={{ textAlign:"center", maxWidth:"480px", padding:"48px 32px" }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:"10px", marginBottom:"40px" }}>
+        <div style={{ width:"100%", maxWidth:"420px", padding:"48px 32px" }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:"10px", marginBottom:"36px" }}>
             <div style={{ width:"44px", height:"44px", borderRadius:"12px", background:`linear-gradient(135deg, ${TEAL}, ${TEAL_DARK})`, display:"flex", alignItems:"center", justifyContent:"center" }}>
               <svg viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width:"22px", height:"22px" }}><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
             </div>
             <span style={{ fontFamily:"'DM Serif Display', serif", fontSize:"22px", color:"#134e4a", letterSpacing:"-0.3px" }}>AI Caretaker</span>
           </div>
-          <h1 style={{ fontFamily:"'DM Serif Display', serif", fontSize:"36px", color:"#0f172a", margin:"0 0 8px", letterSpacing:"-0.5px" }}>Welcome back</h1>
-          <p style={{ color:"#64748b", fontSize:"15px", margin:"0 0 40px", lineHeight:1.6 }}>Select your profile to access the caregiver dashboard</p>
-          {caregiversLoading && <p style={{ color:"#94a3b8", fontSize:"14px", marginBottom:"20px" }}>Loading caregivers…</p>}
-          <div style={{ display:"flex", gap:"16px", justifyContent:"center", flexWrap:"wrap" }}>
-            {caregivers.map(c => (
-              <button key={c.id} className="cg-btn"
-                onClick={() => { setSelectedCaregiver(c); setStep("patient"); }}
-                style={{ border:"1.5px solid #e2e8f0", background:"white", borderRadius:"16px", padding:"24px 32px", cursor:"pointer", minWidth:"160px", display:"flex", flexDirection:"column", alignItems:"center", gap:"12px", boxShadow:"0 2px 8px rgba(0,0,0,0.05)" }}
-              >
-                <div style={{ width:"52px", height:"52px", borderRadius:"50%", background:`linear-gradient(135deg, ${TEAL_LIGHT}, #a7f3d0)`, display:"flex", alignItems:"center", justifyContent:"center", color:TEAL_DARK, fontWeight:"700", fontSize:"16px" }}>
-                  {getInitials(c.first_name, c.last_name)}
-                </div>
-                <span style={{ color:"#1e293b", fontWeight:"600", fontSize:"15px" }}>{c.first_name} {c.last_name}</span>
-                <span style={{ color:TEAL, fontSize:"12px", fontWeight:"500" }}>Log in →</span>
-              </button>
-            ))}
+          <div style={{ textAlign:"center", marginBottom:"32px" }}>
+            <h1 style={{ fontFamily:"'DM Serif Display', serif", fontSize:"34px", color:"#0f172a", margin:"0 0 8px", letterSpacing:"-0.5px" }}>Welcome back</h1>
+            <p style={{ color:"#64748b", fontSize:"15px", margin:0, lineHeight:1.6 }}>Sign in to access your caregiver dashboard</p>
           </div>
+          <div style={{ background:"white", border:"1.5px solid #e2e8f0", borderRadius:"18px", padding:"28px 26px", boxShadow:"0 2px 12px rgba(0,0,0,0.05)" }}>
+            <div style={{ marginBottom:"14px" }}>
+              <label style={{ display:"block", fontSize:"12px", fontWeight:"700", color:"#475569", marginBottom:"6px", letterSpacing:"0.02em" }}>USERNAME</label>
+              <div className="login-input">
+                <span style={{ color:"#94a3b8" }}>{Icons.user}</span>
+                <input
+                  type="text"
+                  placeholder="Enter your username"
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter") handleLogin(); }}
+                  autoComplete="username"
+                />
+              </div>
+            </div>
+            <div style={{ marginBottom:"18px" }}>
+              <label style={{ display:"block", fontSize:"12px", fontWeight:"700", color:"#475569", marginBottom:"6px", letterSpacing:"0.02em" }}>PASSWORD</label>
+              <div className="login-input">
+                <span style={{ color:"#94a3b8" }}>{Icons.lock}</span>
+                <input
+                  type="password"
+                  placeholder="Enter your password"
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter") handleLogin(); }}
+                  autoComplete="current-password"
+                />
+              </div>
+            </div>
+            {loginError && (
+              <div style={{ background:"#fef2f2", border:"1.5px solid #fecaca", borderRadius:"10px", padding:"10px 14px", marginBottom:"16px", color:"#dc2626", fontSize:"13px", fontWeight:"500" }}>
+                {loginError}
+              </div>
+            )}
+            <button className="login-btn" onClick={handleLogin} disabled={loggingIn}
+              style={{ width:"100%", padding:"13px", borderRadius:"12px", border:"none", background:`linear-gradient(135deg, ${TEAL}, ${TEAL_DARK})`, color:"white", fontWeight:"600", fontSize:"15px", cursor:"pointer", boxShadow:"0 4px 16px rgba(13,148,136,0.3)", fontFamily:"inherit" }}>
+              {loggingIn ? "Signing in…" : "Sign In →"}
+            </button>
+          </div>
+          <p style={{ textAlign:"center", color:"#94a3b8", fontSize:"12px", marginTop:"20px", lineHeight:1.6 }}>
+            Access is restricted to registered caregivers.<br/>You will only see patients assigned to you.
+          </p>
         </div>
       </div>
     );
@@ -192,7 +296,7 @@ export default function Home() {
           .continue-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
         `}</style>
         <div style={{ width:"100%", maxWidth:"440px", padding:"32px 24px" }}>
-          <button onClick={() => setStep("caregiver")} style={{ background:"none", border:"none", color:"#64748b", fontSize:"14px", cursor:"pointer", marginBottom:"24px", display:"flex", alignItems:"center", gap:"6px" }}>← Back</button>
+          <button onClick={logout} style={{ background:"none", border:"none", color:"#64748b", fontSize:"14px", cursor:"pointer", marginBottom:"24px", display:"flex", alignItems:"center", gap:"6px" }}>← Log out</button>
           <div style={{ display:"flex", alignItems:"center", gap:"10px", marginBottom:"32px" }}>
             <div style={{ width:"36px", height:"36px", borderRadius:"10px", background:`linear-gradient(135deg, ${TEAL}, ${TEAL_DARK})`, display:"flex", alignItems:"center", justifyContent:"center" }}>
               <svg viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width:"18px", height:"18px" }}><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
@@ -202,7 +306,8 @@ export default function Home() {
           <h2 style={{ fontFamily:"'DM Serif Display', serif", fontSize:"28px", color:"#0f172a", margin:"0 0 6px", letterSpacing:"-0.3px" }}>Select a patient</h2>
           <p style={{ color:"#64748b", fontSize:"14px", margin:"0 0 28px" }}>Hi {selectedCaregiver?.first_name} — choose who you&apos;re checking in on.</p>
           <div style={{ display:"flex", flexDirection:"column", gap:"10px", marginBottom:"28px" }}>
-            {patients.length === 0 && <p style={{ color:"#94a3b8", textAlign:"center", padding:"20px 0" }}>Loading patients…</p>}
+            {patientsLoading && <p style={{ color:"#94a3b8", textAlign:"center", padding:"20px 0" }}>Loading your patients…</p>}
+            {!patientsLoading && patients.length === 0 && <p style={{ color:"#94a3b8", textAlign:"center", padding:"20px 0" }}>No patients are assigned to you yet.</p>}
             {patients.map(p => (
               <div key={p.id} className={`pat-row${selectedPatient?.id === p.id ? " selected" : ""}`} onClick={() => setSelectedPatient(p)}>
                 <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
@@ -323,10 +428,10 @@ export default function Home() {
               {caregiverInitials}
             </div>
             <div style={{ flex:1, minWidth:0 }}>
-              <div style={{ fontSize:"12.5px", fontWeight:"600", color:"#1e293b", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{selectedCaregiver?.first_name}…</div>
+              <div style={{ fontSize:"12.5px", fontWeight:"600", color:"#1e293b", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{selectedCaregiver?.first_name} {selectedCaregiver?.last_name}</div>
               <div style={{ fontSize:"11px", color:"#94a3b8" }}>Caregiver</div>
             </div>
-            <button onClick={() => { setStep("caregiver"); setSelectedCaregiver(null); setSelectedPatient(null); setLogs([]); }} title="Log out" style={{ background:"none", border:"none", cursor:"pointer", color:"#94a3b8", padding:"4px" }}>
+            <button onClick={logout} title="Log out" style={{ background:"none", border:"none", cursor:"pointer", color:"#94a3b8", padding:"4px" }}>
               {Icons.logout}
             </button>
           </div>
@@ -345,6 +450,7 @@ export default function Home() {
             {page==="medicine"     && <div style={{ fontSize:"11.5px", color:"#94a3b8" }}>Medication mentions detected in conversations</div>}
             {page==="activity"     && <div style={{ fontSize:"11.5px", color:"#94a3b8" }}>Activities detected from patient speech</div>}
           </div>
+          <button className="btn-outline" onClick={() => { setStep("patient"); setSelectedPatient(null); setLogs([]); setPage("home"); }} style={{ padding:"6px 12px" }}>Switch Patient</button>
           <div style={{ display:"flex", alignItems:"center", gap:"8px", background:"#f1f5f9", borderRadius:"100px", padding:"6px 14px 6px 8px" }}>
             <div style={{ width:"26px", height:"26px", borderRadius:"50%", background:TEAL_LIGHT, display:"flex", alignItems:"center", justifyContent:"center", color:TEAL_DARK, fontWeight:"700", fontSize:"11px" }}>
               {selectedPatient ? getInitials(selectedPatient.first_name, selectedPatient.last_name) : ""}
