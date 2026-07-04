@@ -1,4 +1,5 @@
 import os
+import secrets
 import smtplib
 import threading
 import time as time_module
@@ -7,9 +8,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from caretaker_brain import process_input, generate_check_in
@@ -41,6 +43,12 @@ pending_speech = {}
 
 state_lock = threading.Lock()
 
+# ---------------------------------------------------------------
+# Login sessions (in-memory: restarting the server logs everyone out)
+# token -> {"caregiver_id": int, "first_name": str, "last_name": str}
+# ---------------------------------------------------------------
+sessions = {}
+
 db = DatabaseService()
 
 
@@ -57,6 +65,18 @@ def parse_ts(ts):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=EASTERN)
     return dt.astimezone(EASTERN)
+
+
+def get_session(authorization: Optional[str]):
+    """Resolve an 'Authorization: Bearer <token>' header to a caregiver
+    session, or raise 401."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not logged in")
+    token = authorization.removeprefix("Bearer ").strip()
+    session = sessions.get(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    return session
 
 
 def build_emergency_sms(e_type: str, score: int, user_text: str, patient_name: str) -> str:
@@ -260,6 +280,57 @@ class ConversationRequest(BaseModel):
     transcript: str
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# ---------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------
+@app.post("/login")
+def login(req: LoginRequest):
+    row = db.verify_caregiver_login(req.username.strip(), req.password)
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_hex(32)
+    sessions[token] = {
+        "caregiver_id": row[0],
+        "first_name": row[1],
+        "last_name": row[2],
+    }
+    return {
+        "token": token,
+        "caregiver": {
+            "id": row[0],
+            "first_name": row[1],
+            "last_name": row[2],
+        },
+    }
+
+
+@app.post("/logout")
+def logout(authorization: Optional[str] = Header(None)):
+    if authorization and authorization.startswith("Bearer "):
+        sessions.pop(authorization.removeprefix("Bearer ").strip(), None)
+    return {"ok": True}
+
+
+@app.get("/me/patients")
+def get_my_patients(authorization: Optional[str] = Header(None)):
+    """Only the logged-in caregiver's patients."""
+    session = get_session(authorization)
+    rows = db.list_patients_for_caregiver(session["caregiver_id"])
+    return [
+        {"id": r[0], "first_name": r[1], "last_name": r[2]}
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------
+# Conversation + device endpoints
+# ---------------------------------------------------------------
 @app.post("/conversation")
 def conversation(req: ConversationRequest):
     now = now_eastern()
@@ -346,24 +417,10 @@ def get_pending_checkin(patient_id: int):
     return {"message": None}
 
 
-@app.get("/patients")
-def get_patients():
-    rows = db.list_patients()
-    return [
-        {"id": r[0], "first_name": r[1], "last_name": r[2]}
-        for r in rows
-    ]
-
-
 @app.get("/patients/{patient_id}/statements")
-def get_statements(patient_id: int):
+def get_statements(patient_id: int, authorization: Optional[str] = Header(None)):
+    """Requires login. Caregivers can only view their own patients' logs."""
+    session = get_session(authorization)
+    if not db.patient_belongs_to_caregiver(patient_id, session["caregiver_id"]):
+        raise HTTPException(status_code=403, detail="This patient is not assigned to you")
     return db.get_recent_statements(patient_id, 20)
-
-
-@app.get("/caregivers")
-def get_caregivers():
-    rows = db.list_caregivers()
-    return [
-        {"id": r[0], "first_name": r[1], "last_name": r[2]}
-        for r in rows
-    ]
