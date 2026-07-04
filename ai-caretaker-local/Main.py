@@ -1,4 +1,5 @@
 import io
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,13 @@ from database_service import DatabaseService
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
+
+CHECKIN_POLL_SECONDS = 5  # how often the device asks the backend for a check-in
+
+# Tracks when the device last played a check-in out loud, so the main loop
+# can throw away any "speech" the mic captured of the device's own voice.
+checkin_playback = {"start": 0.0, "end": 0.0}
+speak_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,16 @@ def send_to_backend(transcript: str, patient_id: int, backend_url: str) -> dict:
     response = requests.post(url, json=payload, timeout=30)
     response.raise_for_status()
     return response.json()
+
+
+def fetch_pending_checkin(patient_id: int, backend_url: str) -> Optional[str]:
+    url = f"{backend_url}/patients/{patient_id}/checkin"
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        return response.json().get("message")
+    except Exception:
+        return None
 
 
 class SpeechService:
@@ -159,6 +177,47 @@ class ListenService:
             return None
 
 
+def start_checkin_poller(cfg: Config, patient_id: int, speaker: SpeechService):
+    """Background thread: polls the backend for queued check-ins and speaks
+    them through the shared speaker. speak_lock guarantees a check-in never
+    talks over a normal assistant reply."""
+
+    def loop():
+        print(f"[CheckIn] Poller started (every {CHECKIN_POLL_SECONDS}s).")
+        while True:
+            message = fetch_pending_checkin(patient_id, cfg.backend_url)
+            if message:
+                print(f"\n[CheckIn] Speaking: {message}")
+                audio = speaker.synthesize(message)
+                with speak_lock:
+                    checkin_playback["start"] = time.time()
+                    speaker.play(audio)
+                    checkin_playback["end"] = time.time()
+            time.sleep(CHECKIN_POLL_SECONDS)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
+
+
+def heard_own_checkin(listen_start: float) -> bool:
+    """True if a check-in was playing at any point while the mic was open,
+    meaning the captured audio is probably the device's own voice."""
+    start = checkin_playback["start"]
+    end = checkin_playback["end"]
+    now = time.time()
+
+    # Check-in currently playing
+    if start > 0 and (end == 0.0 or end < start):
+        return True
+
+    # Playback window (plus a 1.5s echo pad) overlapped the listening window
+    if end > 0 and end + 1.5 >= listen_start and start <= now:
+        return listen_start <= end + 1.5
+
+    return False
+
+
 def main():
     cfg = load_config()
 
@@ -172,10 +231,20 @@ def main():
     speaker = SpeechService()
     listener = ListenService(cfg)
 
+    start_checkin_poller(cfg, active_patient.patient_id, speaker)
+
     try:
         while True:
+            listen_start = time.time()
             user_text = listener.listen_once()
             if not user_text:
+                continue
+
+            # Ignore audio captured while the device was speaking a check-in —
+            # otherwise the mic transcribes the device's own voice and it gets
+            # logged as patient input (falsely counting as a response).
+            if heard_own_checkin(listen_start):
+                print("(Ignored — device was speaking a check-in.)")
                 continue
 
             payload = send_to_backend(
@@ -190,7 +259,8 @@ def main():
 
             print(f"Assistant Reply: {reply}")
             audio = speaker.synthesize(reply)
-            speaker.play(audio)
+            with speak_lock:
+                speaker.play(audio)
 
     finally:
         db.close()
