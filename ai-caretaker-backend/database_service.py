@@ -111,7 +111,23 @@ class DatabaseService:
             (patient_id, limit),
         )
         return self.cursor.fetchall()
-    
+
+    def get_last_user_statement(self, patient_id):
+        """Most recent statement spoken by the patient (speaker = 'User').
+        Returns (statement, timestamp) or None if the patient has never spoken."""
+        self.cursor.execute(
+            """
+            SELECT statement, "timestamp"
+            FROM statement_log
+            WHERE patient_id = %s
+              AND speaker = 'User'
+            ORDER BY "timestamp" DESC
+            LIMIT 1
+            """,
+            (patient_id,),
+        )
+        return self.cursor.fetchone()
+
     def list_caregivers(self):
         self.cursor.execute(
             """
