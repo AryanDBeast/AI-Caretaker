@@ -1,0 +1,7 @@
+SpeechRecognition
+PyAudio
+pygame
+google-cloud-texttospeech
+requests
+python-dotenv
+psycopg[binary]

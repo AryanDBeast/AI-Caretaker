@@ -1,149 +1,166 @@
 # AI Caretaker
 
-## Overview
+A voice-first, in-home support system for people living with dementia. The patient simply talks to a small device. The system answers conversationally, watches for signs of danger, and keeps caregivers informed through a live dashboard and SMS alerts.
 
-AI Caretaker is a full-stack, voice-driven AI system designed to assist dementia patients in real time while providing caregivers with continuous monitoring, structured data logging, and emergency alerts.
-
-The system enables natural, hands-free interaction for patients and supports caregivers through automated tracking, analytics, and notifications.
+Product site: [ai-caretaker.live](https://ai-caretaker.live)
 
 ---
 
-## Motivation
+## Why voice-first
 
-This project was inspired by a real-world scenario involving my grandfather, who has mild dementia. Traditional care solutions often require manual interaction, which is unreliable for patients with memory impairments.
-
-AI Caretaker was built to provide a passive, voice-first solution that prioritizes simplicity for the patient while delivering meaningful insights and alerts to caregivers.
+Most care tools assume the user can remember to open an app, tap a button, or charge a wearable. People with memory impairment often can't. AI Caretaker removes the interface entirely: there is nothing to learn, so the patient talks to it the way they would talk to a person. Everything structured (logging, triage, alerts) happens behind the scenes for the caregiver.
 
 ---
 
-## System Architecture
+## How it works
 
-The system is composed of three primary components:
+```
+ Patient speaks
+      │
+      ▼
+┌──────────────────┐   transcript    ┌───────────────────────────┐
+│  Local device    │ ──────────────▶ │  Backend (FastAPI)         │
+│  (Pi / laptop)   │                 │                           │
+│  STT + TTS       │ ◀────────────── │  LLM → structured JSON     │
+└──────────────────┘   spoken reply  │   • reply                 │
+      ▲                              │   • emergency + severity  │
+      │ polls for check-ins          │   • activity / medication │
+      └───────────────────────────── │  Check-in scheduler        │
+                                     └─────────────┬─────────────┘
+                                                   │
+                         ┌─────────────────────────┼─────────────────────┐
+                         ▼                         ▼                     ▼
+                 PostgreSQL (Supabase)     SMS alert to caregiver   Caregiver dashboard
+                 conversation + event log  (email-to-SMS gateway)   (Next.js)
+```
 
-### 1. Local Device (Patient Interface)
-- Runs on a laptop or Raspberry Pi
-- Captures voice input using speech recognition
-- Sends transcripts to backend API
-- Plays AI-generated responses
-
-### 2. Backend (FastAPI - Deployed on Render)
-- Processes user input using an LLM
-- Detects emergencies and assigns severity scores
-- Logs all interactions to PostgreSQL (Supabase)
-- Sends SMS alerts to caregivers via Gmail → carrier gateway
-
-### 3. Frontend (Next.js - Deployed on Vercel)
-- Caregiver dashboard
-- Displays conversation logs and analytics
-- Provides real-time visibility into patient activity
-
----
-
-## Features
-
-- Voice-based interaction (no manual input required)
-- AI-generated conversational responses
-- Emergency detection with severity scoring
-- Real-time SMS alerts to caregivers
-- Structured logging of:
-  - Conversations
-  - Activities
-  - Medication mentions
-- Caregiver dashboard with analytics and logs
-- Multi-patient support
+1. **Listen.** The local device captures speech, transcribes it, and posts the transcript to the backend.
+2. **Understand.** The backend sends the conversation to an LLM that returns a structured JSON object: the spoken reply, plus any detected emergency (with a 0–100 severity score), activity, or medication mention.
+3. **Act.** Every statement and detection is written to PostgreSQL. Events with severity ≥ 70 trigger an SMS to the patient's assigned caregiver.
+4. **Check in.** If a patient has been quiet for 2 hours during the day (8 AM–8 PM), the backend generates a context-aware check-in from their last statement. If there is no reply within 15 minutes, the caregiver is alerted.
+5. **Review.** Caregivers sign in to the dashboard to see conversation history, emergencies, and medication events for the patients assigned to them.
 
 ---
 
-## Data Flow
+## Repository layout
 
-Patient Speech → Local Device → Backend API → AI Processing  
-                                              ↓  
-                                       Database Logging  
-                                              ↓  
-                                     Emergency Detection  
-                                              ↓  
-                                    SMS Alert to Caregiver  
-                                              ↓  
-                                   Frontend Dashboard  
-
----
-
-## Repository Structure
-
+```
 AI-Caretaker/
-│
-├── ai-caretaker-backend/
-│   ├── main.py
-│   ├── caretaker_brain.py
-│   ├── database_service.py
+├── ai-caretaker-backend/      FastAPI service (deployed on Render)
+│   ├── main.py                API routes, auth, SMS alerts, check-in scheduler
+│   ├── caretaker_brain.py     LLM prompts and structured-output parsing
+│   ├── database_service.py    PostgreSQL access layer
 │   └── requirements.txt
 │
-├── ai-caretaker-frontend/
-│   ├── app/
-│   ├── public/
-│   └── package.json
+├── ai-caretaker-local/        Code that runs on the patient's device
+│   ├── Main.py                Listen → send → speak loop, check-in polling
+│   ├── database_service.py    Patient lookup at startup
+│   ├── test_mic.py            Lists microphone device indices
+│   └── requirements.txt
 │
-├── ai-caretaker-local/
-│   ├── Main.py
-│   └── supporting modules
-│
-└── README.md
+└── ai-caretaker-frontend/     Caregiver dashboard (Next.js, deployed on Vercel)
+    └── app/page.tsx           Login, patient list, logs, emergencies, medications
+```
+
+### API
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/conversation` | Process a patient statement; returns the spoken reply and logs detections |
+| `GET` | `/patients/{id}/checkin` | Device polls for pending check-in messages to speak |
+| `POST` | `/login` / `/logout` | Caregiver session (bcrypt-hashed passwords, bearer tokens) |
+| `GET` | `/me/patients` | Patients assigned to the signed-in caregiver |
+| `GET` | `/patients/{id}/statements` | Conversation and event history (caregiver-scoped) |
 
 ---
 
-## Technologies Used
+## Running it locally
 
-- Python (backend + device logic)
-- FastAPI (API layer)
-- OpenAI API (LLM processing)
-- PostgreSQL / Supabase (database)
-- SpeechRecognition (STT)
-- Google TTS / audio playback (TTS)
-- SMTP (Gmail → SMS gateway)
-- Next.js + Tailwind (frontend)
-- Render (backend hosting)
-- Vercel (frontend hosting)
+**Backend**
 
----
+```bash
+cd ai-caretaker-backend
+pip install -r requirements.txt
+export DATABASE_URL=...          # PostgreSQL connection string
+export OPENAI_API_KEY=...
+export OPENAI_MODEL=gpt-4o-mini
+export GMAIL_ADDRESS=...         # sender account for SMS alerts
+export GMAIL_APP_PASSWORD=...
+uvicorn main:app --reload
+```
 
-## Development Process
+**Patient device**
 
-This project evolved through multiple architectural iterations:
+```bash
+cd ai-caretaker-local
+pip install -r requirements.txt
+export BACKEND_URL=http://localhost:8000
+export DATABASE_URL=...
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/tts-key.json
+python test_mic.py               # find your mic index
+export MIC_DEVICE_INDEX=0
+python Main.py
+```
 
-1. Initial version: fully local Python-based assistant  
-2. Added AI-based emergency detection and structured logging  
-3. Introduced PostgreSQL database for persistent storage  
-4. Refactored into a backend API (FastAPI) for scalability  
-5. Implemented SMS alert system for real-time caregiver notifications  
-6. Built a full frontend dashboard using Next.js  
-7. Deployed system to cloud infrastructure (Render + Vercel)
+**Dashboard**
 
-During development, the repository was restructured from a local-only codebase into a full-stack architecture. This required consolidating and reorganizing the codebase into a clean monorepo format, which resulted in resetting earlier incremental commit history in favor of a clearer, production-ready structure.
+```bash
+cd ai-caretaker-frontend
+npm install
+NEXT_PUBLIC_BACKEND_URL=http://localhost:8000 npm run dev
+```
 
----
-
-## Current Status
-
-- Backend fully deployed and operational  
-- Database integration complete  
-- SMS alert system functional  
-- Frontend dashboard live and connected  
-- End-to-end system working in real time  
-
----
-
-## Future Improvements
-
-- Authentication system for caregivers
-- Real-time push notifications
-- Data visualization (charts and trends)
-- Multi-device deployment (Raspberry Pi hardware)
-- Improved emergency classification models
-- HIPAA-compliant data handling
+No credentials are stored in this repository. Everything is read from environment variables or a local `.env` file.
 
 ---
 
-## Author
+## Tech stack
 
-Aryan Dhingra  
-Bergen County Academies
+| Layer | Tools |
+| --- | --- |
+| Device | Python, Raspberry Pi 4B, SpeechRecognition (Google Web Speech), Google Cloud Text-to-Speech, pygame |
+| Backend | FastAPI, OpenAI API (GPT-4o mini, structured JSON output), psycopg |
+| Data | PostgreSQL on Supabase |
+| Alerts | SMTP → carrier email-to-SMS gateway |
+| Dashboard | Next.js, TypeScript, Tailwind CSS |
+| Hosting | Render (API), Vercel (dashboard) |
+
+---
+
+## Evaluation
+
+Results from testing the deployed system:
+
+| Metric | Result |
+| --- | --- |
+| Speech recognition accuracy | 94.6% |
+| Emergency classification accuracy | 76.7% |
+| Average end-to-end response latency | 3.24 s |
+
+A two-week in-home pilot with 15 families surfaced three main issues: recognition errors with strong accents, latency spikes on weak home Wi-Fi, and patients rarely starting conversations on their own. The last finding led directly to the proactive check-in scheduler in v1.1.
+
+---
+
+## Version history
+
+The project went through several standalone prototypes before it became this repository. Commit history here starts at v1.0, when the code was consolidated into a single monorepo. Earlier versions lived in separate local projects and were not carried over, so they are summarized below instead.
+
+| Version | Date | What changed |
+| --- | --- | --- |
+| **v0.1** – Voice prototype | 2024 | Single-file Python assistant: microphone → speech-to-text → LLM → text-to-speech. Built on the voice pipeline from an earlier assistant project. |
+| **v0.2** – Caretaker logic | 2024–2025 | Caretaker system prompt, an LLM-raised danger flag, morning/evening medication reminders, and conversation logging to a spreadsheet. Typed-input fallback for testing. |
+| **v0.3** – Structured detection | 2025 – early 2026 | Switched from free-text replies to structured JSON (reply + emergency severity + activity + medication). Moved logging from the spreadsheet to PostgreSQL. |
+| **v1.0** – Full-stack system | Apr 2026 | Split into three parts: FastAPI backend, patient device client, and Next.js caregiver dashboard. Multi-patient support, SMS alerts, deployed to Render + Vercel. *(first commit in this repo)* |
+| **v1.1** – Accounts & check-ins | Jul 2026 | Caregiver login with bcrypt-hashed passwords and per-caregiver patient access. Proactive check-in scheduler with missed-response alerts. Dashboard login and caregiver-scoped views. Fixed Supabase lock timeouts by switching the DB layer to autocommit. |
+
+See [CHANGELOG.md](CHANGELOG.md) for details.
+
+---
+
+## Roadmap
+
+- Push notifications alongside SMS
+- Trend charts for activity, mood, and medication adherence
+- Better accent robustness and on-device fallback for poor connectivity
+- Improved emergency classification
+- HIPAA-aligned data handling and persistent session storage
