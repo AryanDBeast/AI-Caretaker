@@ -11,6 +11,8 @@ load_dotenv(dotenv_path=env_path)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Main prompt. In one call the model writes the spoken reply and flags any
+# emergency (with a 0-100 severity), activity, or medication mention.
 SYSTEM_PROMPT = """
 You are a caregiver assistant for a dementia patient.
 Be calm, simple, and safe.
@@ -26,6 +28,7 @@ Return ONLY JSON:
 }
 """
 
+# Used when the patient has gone quiet and we reach out first
 CHECK_IN_SYSTEM_PROMPT = """
 You are a caregiver assistant for a dementia patient.
 The patient has not spoken to you in a while, so you are proactively
@@ -45,6 +48,8 @@ Return ONLY JSON:
 """
 
 
+# Sends what the patient said to the model and returns its JSON:
+# {"reply": ..., "detections": {...}}
 def process_input(user_text: str):
     completion = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL"),
@@ -60,11 +65,11 @@ def process_input(user_text: str):
 
 
 def generate_check_in(last_statement, last_contact_display, hours_since):
-    """Generate a proactive check-in message for the patient.
+    """Write a short check-in for a patient who has gone quiet.
 
-    last_statement: the patient's most recent statement text, or None
-    last_contact_display: human-readable time of last contact, or None
-    hours_since: float hours since last contact, or None if never spoken
+    last_statement: what the patient last said (None if nothing yet)
+    last_contact_display: when they said it, formatted for the prompt
+    hours_since: hours since they last spoke
     """
     if last_statement:
         context = (
@@ -92,6 +97,6 @@ def generate_check_in(last_statement, last_contact_display, hours_since):
     raw = completion.choices[0].message.content
     data = json.loads(raw)
     reply = str(data.get("reply", "")).strip()
-    if not reply:
+    if not reply:  # fallback if the model sends back an empty reply
         reply = "Hello, just checking in on you. How are you feeling right now?"
     return reply

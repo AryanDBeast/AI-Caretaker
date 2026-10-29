@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 
-// ── types ────────────────────────────────────────────────────────────────────
+// Types
 interface Caregiver {
   id: number;
   first_name: string;
@@ -25,7 +25,8 @@ interface LogEntry {
   severity_score?: number;
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// Helpers
+// The API returns each log row as an array, so map it to named fields
 function normalizeLog(raw: any[]): LogEntry {
   return {
     speaker:         raw[0],
@@ -54,12 +55,12 @@ function getInitials(firstName: string, lastName: string) {
   return `${firstName?.[0] ?? ""}${lastName?.[0] ?? ""}`.toUpperCase();
 }
 
-// ── brand colors ──────────────────────────────────────────────────────────────
+// Colors
 const TEAL       = "#0d9488";
 const TEAL_LIGHT = "#ccfbf1";
 const TEAL_DARK  = "#0f766e";
 
-// ── icons ─────────────────────────────────────────────────────────────────────
+// Icons (inline SVG)
 const Icons = {
   home:     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 01-1 1H4a1 1 0 01-1-1V9.5z"/><path d="M9 21V12h6v9"/></svg>,
   chat:     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>,
@@ -78,7 +79,7 @@ const Icons = {
   lock:     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>,
 };
 
-// ══════════════════════════════════════════════════════════════════════════════
+// Flow: caregiver login -> pick a patient -> dashboard
 export default function Home() {
   const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
 
@@ -117,7 +118,7 @@ export default function Home() {
     setStep("login");
   };
 
-  // restore session on mount (survives page refresh)
+  // Stay logged in across page refreshes
   useEffect(() => {
     const savedToken = sessionStorage.getItem("caretaker_token");
     const savedCaregiver = sessionStorage.getItem("caretaker_caregiver");
@@ -161,7 +162,7 @@ export default function Home() {
     }
   };
 
-  // fetch ONLY this caregiver's patients once logged in
+  // After login, load only this caregiver's patients
   useEffect(() => {
     if (!token || step !== "patient") return;
     setPatientsLoading(true);
@@ -175,7 +176,7 @@ export default function Home() {
       .finally(() => setPatientsLoading(false));
   }, [token, step]);
 
-  // fetch logs when patient is selected
+  // Load the conversation log for the selected patient
   useEffect(() => {
     if (!selectedPatient || !token) return;
     setLoading(true);
@@ -206,7 +207,7 @@ export default function Home() {
   const medicines   = logs.filter(l => l.medication_type);
   const activities  = logs.filter(l => l.activity_type);
 
-  // ── STEP 1: caregiver login ───────────────────────────────────────────────
+  // Step 1: caregiver login
   if (step === "login") {
     return (
       <div style={{ fontFamily:"'DM Sans', system-ui, sans-serif", background:"#f0fdf9", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center" }}>
@@ -281,7 +282,7 @@ export default function Home() {
     );
   }
 
-  // ── STEP 2: patient select ────────────────────────────────────────────────
+  // Step 2: pick a patient
   if (step === "patient") {
     return (
       <div style={{ fontFamily:"'DM Sans', system-ui, sans-serif", background:"#f0fdf9", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center" }}>
@@ -332,7 +333,7 @@ export default function Home() {
     );
   }
 
-  // ── MAIN DASHBOARD ────────────────────────────────────────────────────────
+  // Main dashboard
   const navItems = [
     { key:"home",         label:"Home",               icon:Icons.home },
     { key:"conversation", label:"Convo History",      icon:Icons.chat },
@@ -396,7 +397,7 @@ export default function Home() {
         @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
       `}</style>
 
-      {/* SIDEBAR */}
+      {/* Sidebar */}
       {sidebarOpen && (
         <aside style={{ width:"220px", flexShrink:0, background:"white", borderRight:"1.5px solid #e2e8f0", display:"flex", flexDirection:"column", height:"100vh", overflow:"hidden" }}>
           <div style={{ padding:"20px 18px 16px", borderBottom:"1.5px solid #f1f5f9" }}>
@@ -438,7 +439,7 @@ export default function Home() {
         </aside>
       )}
 
-      {/* MAIN CONTENT */}
+      {/* Main content */}
       <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
         <header style={{ height:"56px", borderBottom:"1.5px solid #e2e8f0", background:"white", display:"flex", alignItems:"center", padding:"0 24px", gap:"14px", flexShrink:0 }}>
           <button onClick={() => setSidebarOpen(v=>!v)} style={{ background:"none", border:"none", cursor:"pointer", color:"#64748b", display:"flex", lineHeight:1 }}>{Icons.menu}</button>
@@ -462,7 +463,7 @@ export default function Home() {
 
         <main style={{ flex:1, overflowY:"auto", padding:"28px 32px" }} className="fade-in">
 
-          {/* HOME */}
+          {/* Home: overview */}
           {page==="home" && (
             <div>
               <div style={{ background:`linear-gradient(135deg, #f0fdf9 0%, #ccfbf1 100%)`, border:`1.5px solid #99f6e4`, borderRadius:"20px", padding:"32px 36px", marginBottom:"28px", position:"relative", overflow:"hidden" }}>
@@ -552,7 +553,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* CONVERSATION LOG */}
+          {/* Conversation log */}
           {page==="conversation" && (
             <div>
               <div style={{ display:"flex", alignItems:"center", gap:"12px", marginBottom:"20px" }}>
@@ -595,7 +596,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* EMERGENCY LOG */}
+          {/* Emergency log */}
           {page==="emergency" && (
             <div>
               {emergencies.length === 0 && (
@@ -635,7 +636,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* MEDICINE LOG */}
+          {/* Medication log */}
           {page==="medicine" && (
             <div>
               {medicines.length === 0 && (
@@ -659,7 +660,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* ACTIVITY LOG */}
+          {/* Activity log */}
           {page==="activity" && (
             <div>
               {activities.length === 0 && (
@@ -683,7 +684,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* PRIVACY / TERMS */}
+          {/* Privacy and terms */}
           {(page==="privacy"||page==="terms") && (
             <div style={{ maxWidth:"640px" }}>
               <div style={{ background:"white", border:"1.5px solid #e2e8f0", borderRadius:"16px", padding:"32px 36px" }}>

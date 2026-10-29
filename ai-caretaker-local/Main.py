@@ -17,10 +17,10 @@ from database_service import DatabaseService
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
-CHECKIN_POLL_SECONDS = 5  # how often the device asks the backend for a check-in
+CHECKIN_POLL_SECONDS = 5  # how often to ask the backend for a check-in
 
-# Tracks when the device last played a check-in out loud, so the main loop
-# can throw away any "speech" the mic captured of the device's own voice.
+# When the device last said a check-in out loud. Used to throw away anything
+# the mic picked up of the device's own voice.
 checkin_playback = {"start": 0.0, "end": 0.0}
 speak_lock = threading.Lock()
 
@@ -55,6 +55,7 @@ def load_config() -> Config:
     )
 
 
+# Asks in the terminal which patient this device belongs to
 def choose_patient(db: DatabaseService) -> ActivePatient:
     patients = db.list_patients()
 
@@ -145,7 +146,7 @@ class ListenService:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.recognizer = sr.Recognizer()
-        self.recognizer.pause_threshold = 2
+        self.recognizer.pause_threshold = 2  # 2s of silence ends a phrase (patients often pause mid-sentence)
         self.recognizer.energy_threshold = 300
         self.recognizer.dynamic_energy_threshold = True
 
@@ -178,9 +179,8 @@ class ListenService:
 
 
 def start_checkin_poller(cfg: Config, patient_id: int, speaker: SpeechService):
-    """Background thread: polls the backend for queued check-ins and speaks
-    them through the shared speaker. speak_lock guarantees a check-in never
-    talks over a normal assistant reply."""
+    """Background thread that asks the backend for check-ins and says them.
+    speak_lock makes sure a check-in never talks over a normal reply."""
 
     def loop():
         print(f"[CheckIn] Poller started (every {CHECKIN_POLL_SECONDS}s).")
@@ -201,17 +201,17 @@ def start_checkin_poller(cfg: Config, patient_id: int, speaker: SpeechService):
 
 
 def heard_own_checkin(listen_start: float) -> bool:
-    """True if a check-in was playing at any point while the mic was open,
-    meaning the captured audio is probably the device's own voice."""
+    """True if a check-in was playing while the mic was open, which means
+    the audio we just got is probably the device hearing itself."""
     start = checkin_playback["start"]
     end = checkin_playback["end"]
     now = time.time()
 
-    # Check-in currently playing
+    # A check-in is playing right now
     if start > 0 and (end == 0.0 or end < start):
         return True
 
-    # Playback window (plus a 1.5s echo pad) overlapped the listening window
+    # Playback (plus 1.5s for echo) overlapped with when we were listening
     if end > 0 and end + 1.5 >= listen_start and start <= now:
         return listen_start <= end + 1.5
 
@@ -240,9 +240,9 @@ def main():
             if not user_text:
                 continue
 
-            # Ignore audio captured while the device was speaking a check-in —
-            # otherwise the mic transcribes the device's own voice and it gets
-            # logged as patient input (falsely counting as a response).
+            # Skip audio recorded while the device was saying a check-in.
+            # Otherwise it transcribes itself and logs that as the patient
+            # answering.
             if heard_own_checkin(listen_start):
                 print("(Ignored — device was speaking a check-in.)")
                 continue

@@ -22,31 +22,27 @@ from fastapi.middleware.cors import CORSMiddleware
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# ---------------------------------------------------------------
-# Check-in configuration
-# ---------------------------------------------------------------
-EASTERN = ZoneInfo("America/New_York")   # EST/EDT, handles daylight saving
-CHECK_IN_AFTER = timedelta(hours=2)      # check in after 2h of no contact
-RESPONSE_WINDOW = timedelta(minutes=15)  # how long the patient has to respond
-ACTIVE_START_HOUR = 8                    # 8:00 AM Eastern
-ACTIVE_END_HOUR = 20                     # 8:00 PM Eastern (exclusive)
-LOOP_SECONDS = 60                        # scheduler wake-up interval
-NO_RESPONSE_SEVERITY = 80                # severity score for the alert SMS
+# Check-in settings (all times US Eastern)
+EASTERN = ZoneInfo("America/New_York")   # handles the EST/EDT switch
+CHECK_IN_AFTER = timedelta(hours=2)      # quiet this long -> send a check-in
+RESPONSE_WINDOW = timedelta(minutes=15)  # time to answer before we alert
+ACTIVE_START_HOUR = 8                    # 8 AM
+ACTIVE_END_HOUR = 20                     # 8 PM (not inclusive)
+LOOP_SECONDS = 60                        # how often the scheduler runs
+NO_RESPONSE_SEVERITY = 80                # severity logged for a missed check-in
 
-# In-memory per-patient scheduler state:
-# patient_id -> {"awaiting_since": datetime|None, "last_check_in": datetime|None}
+# Scheduler state for each patient, kept in memory.
+# patient_id -> {"awaiting_since": datetime or None, "last_check_in": datetime or None}
 check_in_state = {}
 
-# Check-in messages waiting to be spoken by the device:
-# patient_id -> [message, ...]  (device polls GET /patients/{id}/checkin)
+# Check-ins waiting for the device to pick up and say out loud.
+# patient_id -> [message, ...]  (the device polls GET /patients/{id}/checkin)
 pending_speech = {}
 
 state_lock = threading.Lock()
 
-# ---------------------------------------------------------------
-# Login sessions (in-memory: restarting the server logs everyone out)
-# token -> {"caregiver_id": int, "first_name": str, "last_name": str}
-# ---------------------------------------------------------------
+# Logged-in caregivers: token -> {"caregiver_id", "first_name", "last_name"}
+# Kept in memory, so restarting the server logs everyone out.
 sessions = {}
 
 db = DatabaseService()
@@ -57,7 +53,7 @@ def now_eastern():
 
 
 def parse_ts(ts):
-    """Normalize a DB timestamp (str or datetime) to an aware Eastern datetime."""
+    """Turn a DB timestamp (string or datetime) into an Eastern-time datetime."""
     if isinstance(ts, datetime):
         dt = ts
     else:
@@ -68,8 +64,8 @@ def parse_ts(ts):
 
 
 def get_session(authorization: Optional[str]):
-    """Resolve an 'Authorization: Bearer <token>' header to a caregiver
-    session, or raise 401."""
+    """Find the logged-in caregiver from the 'Authorization: Bearer <token>'
+    header. Raises 401 if the token is missing or expired."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not logged in")
     token = authorization.removeprefix("Bearer ").strip()
@@ -79,6 +75,7 @@ def get_session(authorization: Optional[str]):
     return session
 
 
+# Builds the alert text sent to the caregiver when an emergency is detected.
 def build_emergency_sms(e_type: str, score: int, user_text: str, patient_name: str) -> str:
     e_type_clean = e_type.strip().title()
     msg = (
@@ -93,6 +90,8 @@ def build_emergency_sms(e_type: str, score: int, user_text: str, patient_name: s
     return msg
 
 
+# Sends a text by emailing Verizon's email-to-SMS gateway (<number>@vtext.com)
+# from a Gmail account, so no paid SMS service is needed. Verizon numbers only.
 def send_verizon_sms_via_gmail(body: str, caregiver_phone: str) -> bool:
     gmail_addr = os.getenv("GMAIL_ADDRESS", "").strip()
     gmail_app_pw = os.getenv("GMAIL_APP_PASSWORD", "").strip()
@@ -108,6 +107,7 @@ def send_verizon_sms_via_gmail(body: str, caregiver_phone: str) -> bool:
 
     to_addr = f"{digits_only}@vtext.com"
 
+    # the gateway cuts texts off at 160 characters
     body = (body or "").strip()
     if len(body) > 160:
         body = body[:157] + "..."
@@ -129,9 +129,11 @@ def send_verizon_sms_via_gmail(body: str, caregiver_phone: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------
 # Check-in scheduler
-# ---------------------------------------------------------------
+#
+# Each cycle, for every patient: if we're waiting on a reply to a check-in,
+# see if they answered (or alert the caregiver if time ran out). Otherwise,
+# send a new check-in if they've been quiet for CHECK_IN_AFTER.
 def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: datetime):
     with state_lock:
         state = check_in_state.setdefault(
@@ -144,17 +146,17 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
     last_user_text = last_user[0] if last_user else None
     last_user_time = parse_ts(last_user[1]) if last_user else None
 
-    # --- Case 1: we sent a check-in and are waiting for a response ---
+    # Waiting on a reply to the last check-in
     if awaiting_since is not None:
         if last_user_time is not None and last_user_time >= awaiting_since:
-            # Patient responded — all good
+            # They answered, nothing else to do
             with state_lock:
                 check_in_state[patient_id]["awaiting_since"] = None
             print(f"[CheckIn] Patient {patient_id} responded to check-in.")
             return
 
         if now - awaiting_since >= RESPONSE_WINDOW:
-            # No response within the window — alert the caregiver, then continue
+            # No answer in time, so text the caregiver
             patient_row = sched_db.get_patient_with_caregiver(patient_id)
             if patient_row:
                 patient_name = f"{patient_row[1]} {patient_row[2]}"
@@ -166,7 +168,7 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
                 )
                 send_verizon_sms_via_gmail(sms_body, caregiver_phone)
 
-            # Log the missed check-in so it shows in the statement history
+            # Log it so the missed check-in shows up on the dashboard
             sched_db.append_statement(
                 patient_id,
                 now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -183,7 +185,7 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
             print(f"[CheckIn] Patient {patient_id} did not respond. Caregiver alerted.")
         return
 
-    # --- Case 2: not awaiting — decide whether a new check-in is due ---
+    # Not waiting on anything. Is a new check-in due?
     recent_contact = (
         last_user_time is not None and (now - last_user_time) < CHECK_IN_AFTER
     )
@@ -193,7 +195,7 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
     if recent_contact or recent_check_in:
         return
 
-    # Time to check in
+    # They've been quiet long enough. Base the check-in on what they last said.
     hours_since = None
     last_contact_display = None
     if last_user_time is not None:
@@ -213,7 +215,7 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
         reply,
     )
 
-    # Queue the message for the device to speak
+    # The device picks this up on its next poll and says it
     with state_lock:
         pending_speech.setdefault(patient_id, []).append(reply)
         check_in_state[patient_id]["last_check_in"] = now
@@ -225,9 +227,9 @@ def handle_patient_check_in(sched_db: DatabaseService, patient_id: int, now: dat
 def run_check_in_cycle(sched_db: DatabaseService):
     now = now_eastern()
 
-    # Only operate between 8 AM and 8 PM Eastern
+    # Only check in between 8 AM and 8 PM Eastern
     if not (ACTIVE_START_HOUR <= now.hour < ACTIVE_END_HOUR):
-        # Clear pending windows and unspoken messages so nothing fires overnight
+        # Overnight: drop anything pending so nobody gets woken up
         with state_lock:
             for state in check_in_state.values():
                 state["awaiting_since"] = None
@@ -243,8 +245,8 @@ def run_check_in_cycle(sched_db: DatabaseService):
 
 
 def check_in_loop():
-    # Separate DB connection — psycopg connections are not thread-safe,
-    # so the scheduler thread must not share the API's connection.
+    # The scheduler gets its own DB connection because psycopg connections
+    # aren't safe to share between threads.
     sched_db = DatabaseService()
     print("[CheckIn] Scheduler started (8 AM - 8 PM Eastern, 2h inactivity).")
     while True:
@@ -255,6 +257,7 @@ def check_in_loop():
         time_module.sleep(LOOP_SECONDS)
 
 
+# Start the check-in scheduler in the background when the server starts
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     thread = threading.Thread(target=check_in_loop, daemon=True)
@@ -264,6 +267,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# The dashboard is hosted on a different domain, so allow cross-origin calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -283,9 +287,7 @@ class LoginRequest(BaseModel):
     password: str
 
 
-# ---------------------------------------------------------------
-# Auth endpoints
-# ---------------------------------------------------------------
+# Caregiver login
 @app.post("/login")
 def login(req: LoginRequest):
     row = db.verify_caregiver_login(req.username.strip(), req.password)
@@ -317,7 +319,7 @@ def logout(authorization: Optional[str] = Header(None)):
 
 @app.get("/me/patients")
 def get_my_patients(authorization: Optional[str] = Header(None)):
-    """Only the logged-in caregiver's patients."""
+    """Patients assigned to the logged-in caregiver."""
     session = get_session(authorization)
     rows = db.list_patients_for_caregiver(session["caregiver_id"])
     return [
@@ -326,15 +328,13 @@ def get_my_patients(authorization: Optional[str] = Header(None)):
     ]
 
 
-# ---------------------------------------------------------------
-# Conversation + device endpoints
-# ---------------------------------------------------------------
+# Conversation and device endpoints
 @app.post("/conversation")
 def conversation(req: ConversationRequest):
     now = now_eastern()
 
-    # Any patient message counts as a response to a pending check-in,
-    # and cancels any queued check-in that hasn't been spoken yet
+    # Anything the patient says counts as answering a check-in, and cancels
+    # a check-in that's queued but hasn't been spoken yet
     with state_lock:
         if req.patient_id in check_in_state:
             check_in_state[req.patient_id]["awaiting_since"] = None
@@ -386,6 +386,7 @@ def conversation(req: ConversationRequest):
 
         patient_name = f"{patient_first_name} {patient_last_name}"
 
+        # Only text the caregiver for serious emergencies (70+ out of 100)
         if emergency_type and severity_score is not None and severity_score >= 70:
             sms_body = build_emergency_sms(
                 emergency_type,
@@ -403,8 +404,8 @@ def conversation(req: ConversationRequest):
 
 @app.get("/patients/{patient_id}/checkin")
 def get_pending_checkin(patient_id: int):
-    """Polled by the device every few seconds.
-    Returns a check-in message exactly once, then removes it from the queue."""
+    """Polled by the device every few seconds. Each check-in is handed out
+    once and then removed from the queue."""
     with state_lock:
         queue = pending_speech.get(patient_id)
         if queue:
@@ -417,7 +418,8 @@ def get_pending_checkin(patient_id: int):
 
 @app.get("/patients/{patient_id}/statements")
 def get_statements(patient_id: int, authorization: Optional[str] = Header(None)):
-    """Requires login. Caregivers can only view their own patients' logs."""
+    """Conversation history for a patient. Requires login, and caregivers
+    can only see their own patients."""
     session = get_session(authorization)
     if not db.patient_belongs_to_caregiver(patient_id, session["caregiver_id"]):
         raise HTTPException(status_code=403, detail="This patient is not assigned to you")

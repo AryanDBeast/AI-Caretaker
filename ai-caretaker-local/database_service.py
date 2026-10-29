@@ -2,6 +2,7 @@ import os
 import psycopg
 
 
+# Lookups the device needs at startup to pick a patient
 class DatabaseService:
     def __init__(self):
         database_url = os.getenv("DATABASE_URL")

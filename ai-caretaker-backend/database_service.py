@@ -15,9 +15,9 @@ class DatabaseService:
         if not database_url:
             raise ValueError("DATABASE_URL not found in environment")
 
-        # autocommit: without it, psycopg holds every SELECT open in an idle
-        # transaction, which keeps table locks and blocks things like
-        # ALTER TABLE (causing "upstream timeout" errors in Supabase).
+        # autocommit is on because otherwise psycopg leaves every SELECT in an
+        # open transaction. Those held table locks and caused "upstream
+        # timeout" errors in Supabase.
         self.conn = psycopg.connect(database_url, autocommit=True)
         self.cursor = self.conn.cursor()
 
@@ -31,6 +31,7 @@ class DatabaseService:
         except Exception:
             pass
 
+    # Saves one line of the conversation, plus anything the model flagged
     def append_statement(
         self,
         patient_id,
@@ -67,8 +68,9 @@ class DatabaseService:
                 severity_score,
             ),
         )
-        # autocommit connection — the INSERT is committed immediately
+        # no commit() needed, the connection is in autocommit mode
 
+    # Patient info plus their caregiver's name and phone (used for alerts)
     def get_patient_with_caregiver(self, patient_id):
         self.cursor.execute(
             """
@@ -116,8 +118,8 @@ class DatabaseService:
         return self.cursor.fetchall()
 
     def get_last_user_statement(self, patient_id):
-        """Most recent statement spoken by the patient (speaker = 'User').
-        Returns (statement, timestamp) or None if the patient has never spoken."""
+        """Last thing the patient said, as (statement, timestamp).
+        Returns None if they haven't said anything yet."""
         self.cursor.execute(
             """
             SELECT statement, "timestamp"
@@ -131,13 +133,12 @@ class DatabaseService:
         )
         return self.cursor.fetchone()
 
-    # -----------------------------------------------------------
-    # Login / caregiver-scoped queries
-    # -----------------------------------------------------------
+    # Login and caregiver access checks
     def verify_caregiver_login(self, username, password):
-        """Check username + password against the bcrypt hash in the DB.
-        Verification happens inside Postgres via pgcrypto's crypt(),
-        so the hash never leaves the database.
+        """Check a caregiver's username and password.
+
+        The bcrypt check runs inside Postgres (pgcrypto's crypt()), so the
+        stored hash never comes back to the app.
         Returns (caregiver_id, first_name, last_name) or None."""
         self.cursor.execute(
             """
@@ -152,7 +153,7 @@ class DatabaseService:
         return self.cursor.fetchone()
 
     def list_patients_for_caregiver(self, caregiver_id):
-        """Only the patients assigned to this caregiver."""
+        """Patients assigned to this caregiver."""
         self.cursor.execute(
             """
             SELECT patient_id, patient_first_name, patient_last_name
